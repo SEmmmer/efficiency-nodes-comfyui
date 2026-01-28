@@ -33,7 +33,7 @@ font_path = os.path.join(my_dir, 'arial.ttf')
 sys.path.append(comfy_dir)
 from nodes import LatentUpscaleBy, KSampler, KSamplerAdvanced, VAEDecode, VAEDecodeTiled, VAEEncode, VAEEncodeTiled, \
     ImageScaleBy, CLIPSetLastLayer, CLIPTextEncode, ControlNetLoader, ControlNetApply, ControlNetApplyAdvanced, \
-    PreviewImage, MAX_RESOLUTION
+    PreviewImage, SaveImage, MAX_RESOLUTION
 from comfy_extras.nodes_upscale_model import UpscaleModelLoader, ImageUpscaleWithModel
 from comfy_extras.nodes_clip_sdxl import CLIPTextEncodeSDXL, CLIPTextEncodeSDXLRefiner
 import comfy.sample
@@ -801,8 +801,18 @@ class TSC_KSampler:
             latent_image = latent_tensors[0]
 
             # Unpack script Tuple (X_type, X_value, Y_type, Y_value, grid_spacing, Y_label_orientation, dependencies)
-            X_type, X_value, Y_type, Y_value, grid_spacing, Y_label_orientation, cache_models, xyplot_as_output_image,\
-                xyplot_id, dependencies = script["xyplot"]
+            xy = script["xyplot"]
+            # 兼容旧 tuple（10项）与新 tuple（11项，末尾带 diag_only）
+            if len(xy) == 10:
+                X_type, X_value, Y_type, Y_value, grid_spacing, Y_label_orientation, cache_models, xyplot_as_output_image, \
+                    xyplot_id, dependencies = xy
+                diag_only = False
+            elif len(xy) == 11:
+                X_type, X_value, Y_type, Y_value, grid_spacing, Y_label_orientation, cache_models, xyplot_as_output_image, \
+                    xyplot_id, dependencies, diag_only = xy
+            else:
+                raise ValueError(f"Unexpected xyplot tuple length: {len(xy)}")
+
 
             #_______________________________________________________________________________________________________
             # The below section is used to check wether the XY_type is allowed for the Ksampler instance being used.
@@ -1499,6 +1509,8 @@ class TSC_KSampler:
              # Initiate Plot label text variables X/Y_label
             X_label = []
             Y_label = []
+            diag_image_tensor_list = []
+            diag_latent_entries = []
 
             # Store the KSamplers original scheduler inside the same scheduler variable
             scheduler = (scheduler, scheduler)
@@ -1509,6 +1521,22 @@ class TSC_KSampler:
 
             # Store types in a Tuple for easy function passing
             types = (X_type, Y_type)
+
+            def _strip_sr_none_first(t, v):
+                if t in ("Positive Prompt S/R", "Negative Prompt S/R"):
+                    if isinstance(v, list) and len(v) > 0:
+                        v0 = v[0]
+                        if isinstance(v0, tuple) and len(v0) >= 2 and v0[1] is None:
+                            return v[1:]
+                return v
+
+            if diag_only:
+                X_value = _strip_sr_none_first(X_type, X_value)
+                Y_value = _strip_sr_none_first(Y_type, Y_value)
+
+                # 严格绑定（你也可以改成 min 截断）
+                if X_type != "Nothing" and Y_type != "Nothing" and len(X_value) != len(Y_value):
+                    raise ValueError(f"Diagonal XY requires len(X)==len(Y). X={len(X_value)} Y={len(Y_value)}")
 
             # Clone original model parameters
             def clone_or_none(*originals):
@@ -1567,6 +1595,21 @@ class TSC_KSampler:
                 elif X_type != "Nothing" and Y_type != "Nothing":
                     for Y_index, Y in enumerate(Y_value):
 
+                        # diag_only: 只在对角线(X_index==Y_index)跑采样，其余格子塞占位，保证拼图不崩
+                        if diag_only and (X_index != Y_index):
+                            w = empty_latent_width if empty_latent_width else 512
+                            h = empty_latent_height if empty_latent_height else 512
+                            ph_pil = Image.new("RGB", (w, h), (255, 255, 255))
+                            image_pil_list.append(ph_pil)
+                            image_tensor_list.append(pil2tensor(ph_pil))
+                            # latent 占位：按 latent_image 的 key 做 zeros_like，保证后面 torch.cat 不炸
+                            if isinstance(latent_image, dict):
+                                latent_list.append({k: torch.zeros_like(v) for k, v in latent_image.items()})
+                            else:
+                                latent_list.append(latent_image)
+                            continue
+
+
                         if Y_type == "XY_Capsule" or X_type == "XY_Capsule":
                             model, clip, refiner_model, refiner_clip = \
                                 clone_or_none(original_model, original_clip, original_refiner_model, original_refiner_clip)
@@ -1607,6 +1650,8 @@ class TSC_KSampler:
                                            return_with_leftover_noise, cfg, sampler_name, scheduler[0],
                                            positive, negative, refiner_positive, refiner_negative, latent_image,
                                            denoise, vae, vae_decode, sampler_type, xy_capsule=xy_capsule)
+                        diag_image_tensor_list.append(image_tensor_list[-1])
+                        diag_latent_entries.append(latent_list[-1])
 
             # Clean up cache
             if cache_models == "False":
@@ -2005,20 +2050,64 @@ class TSC_KSampler:
             num_rows = max(len(Y_value) if Y_value is not None else 0, 1)
             num_cols = max(len(X_value) if X_value is not None else 0, 1)
 
-            # Flip X & Y results back if flipped earlier (for Checkpoint/LoRA For loop optimizations)
-            if flip_xy == True:
-                X_type, Y_type = Y_type, X_type
-                X_value, Y_value = Y_value, X_value
-                X_label, Y_label = Y_label, X_label
-                num_rows, num_cols = num_cols, num_rows
-                image_pil_list = rearrange_list_A(image_pil_list, num_rows, num_cols)
+            # ----------------------------------------------------------------------
+            # ✅ diag_only：强制把拼图变成 1×N（只显示 LoRA），不再当成网格，也不需要 Y 轴
+            if diag_only:
+                print("DIAG COLLAPSE ACTIVE", len(diag_image_tensor_list))
+                if len(diag_image_tensor_list) == 0:
+                    raise ValueError("diag_only: diag_image_tensor_list is empty")
+
+                # 用对角线真实采样结果替换掉网格列表
+                image_tensor_list = diag_image_tensor_list[:]
+                latent_list = diag_latent_entries[:]  # 后面 cat 只 cat 这 N 份
+                image_pil_list = [tensor2pil(t) for t in image_tensor_list]
+
+                num_rows = 1
+                num_cols = len(image_pil_list)
+
+                # 禁用 Y 轴（不留左边距，不画标签）
+                Y_type = "Nothing"
+                Y_label = []
+                Y_value = [""]  # 让 print_plot_variables 不再显示 8×9
+
+                # ⚠️ 关键：diag_only 时不要再跑 rearrange_list_*，否则又回到网格语义
             else:
-                image_pil_list = rearrange_list_B(image_pil_list, num_rows, num_cols)
-                image_tensor_list = rearrange_list_A(image_tensor_list, num_cols, num_rows)
-                latent_list = rearrange_list_A(latent_list, num_cols, num_rows)
+                # Flip X & Y results back if flipped earlier
+                if flip_xy == True:
+                    X_type, Y_type = Y_type, X_type
+                    X_value, Y_value = Y_value, X_value
+                    X_label, Y_label = Y_label, X_label
+                    num_rows, num_cols = num_cols, num_rows
+                    image_pil_list = rearrange_list_A(image_pil_list, num_rows, num_cols)
+                else:
+                    image_pil_list = rearrange_list_B(image_pil_list, num_rows, num_cols)
+                    image_tensor_list = rearrange_list_A(image_tensor_list, num_cols, num_rows)
+                    latent_list = rearrange_list_A(latent_list, num_cols, num_rows)
+            # ----------------------------------------------------------------------
+
+            # -----------------------------------------------------------------------------------
+            # diag_only 总图模式：只输出 1 行 N 列（只显示 LoRA），完全禁用 Y 轴（提示词那维不显示）
+            if diag_only and xyplot_as_output_image:
+                if len(diag_image_tensor_list) == 0:
+                    raise ValueError("diag_only+Plot: diag_image_tensor_list is empty (no diagonal samples collected).")
+
+                # 1) 只用对角线真实采样结果（别用带 placeholder 的网格列表）
+                image_tensor_list = diag_image_tensor_list[:]  # 用于后面取 i_height/i_width 等
+                latent_list = diag_latent_entries[:]  # 用于后面 cat 合并
+                image_pil_list = [tensor2pil(t) for t in image_tensor_list]  # 用于拼图 paste
+
+                # 2) 强制 1 行 N 列
+                num_rows = 1
+                num_cols = len(image_pil_list)
+
+                # 3) 彻底禁用 Y 轴（不画、不留边距、不访问 Y_label）
+                Y_type = "Nothing"
+                Y_label = []
+                Y_value = [""]  # 可选：让打印/信息更一致（不再显示 8x9）
+            # -----------------------------------------------------------------------------------
 
             # Extract final image dimensions
-            i_height, i_width = image_tensor_list[0].shape[1], image_tensor_list[0].shape[2]
+            i_width, i_height = image_pil_list[0].size
 
             # Print XY Plot Results
             print_plot_variables(X_type, Y_type, X_value, Y_value, add_noise, seed,  steps, start_at_step, end_at_step,
@@ -2179,11 +2268,40 @@ class TSC_KSampler:
 
             xy_plot_image = pil2tensor(background)
 
-         # Generate the preview_images
-        preview_images = PreviewImage().save_images(xy_plot_image)["ui"]["images"]
+        # --- 缩放 plot 到 75%（用于预览 + 自动保存）---
+        try:
+            plot_pil = tensor2pil(xy_plot_image)  # tensor2pil 通常会取 batch 的第一张
+            w, h = plot_pil.size
+            nw = max(1, int(w * 0.5))
+            nh = max(1, int(h * 0.5))
+            plot_pil_small = plot_pil.resize((nw, nh), resample=Image.LANCZOS)
+            xy_plot_image_small = pil2tensor(plot_pil_small)
+        except Exception as e:
+            print(f"{warning('XY Plot Warning:')} plot resize failed, using original plot. err={e}")
+            xy_plot_image_small = xy_plot_image
+
+        # 预览显示缩小版（避免预览区太大、也少点开销）
+        preview_images = PreviewImage().save_images(xy_plot_image_small)["ui"]["images"]
+
+        # 如果当前输出模式是 Images（不是 Plot），就把缩小后的 plot 额外保存到 output 目录
+        # 这样你不用右键保存预览图了
+        if xyplot_as_output_image == False:
+            try:
+                # filename_prefix 你可以随便改，比如 "xyplot_75"
+                SaveImage().save_images(xy_plot_image_small, filename_prefix="单次")
+            except Exception as e:
+                print(f"{warning('XY Plot Warning:')} auto-save plot failed. err={e}")
 
         # Generate output_images
         output_images = torch.stack([tensor.squeeze() for tensor in image_tensor_list])
+
+        # diag_only + Images：输出只给对角线那 N 张（绑定后的 lora/prompt 对）
+        if diag_only and (xyplot_as_output_image == False):
+            output_images = torch.stack([t.squeeze() for t in diag_image_tensor_list])
+            # latent 也同步改成对角线
+            if len(diag_latent_entries) > 0:
+                keys = diag_latent_entries[0].keys()
+                latent_list = {k: torch.cat([d[k] for d in diag_latent_entries], dim=0) for k in keys}
 
         # Set the output_image the same as plot image defined by 'xyplot_as_output_image'
         if xyplot_as_output_image == True:
@@ -2353,7 +2471,8 @@ class TSC_XYplot:
                     "XY_flip": (["False","True"],),
                     "Y_label_orientation": (["Horizontal", "Vertical"],),
                     "cache_models": (["True", "False"],),
-                    "ksampler_output_image": (["Images","Plot"],),},
+                    "ksampler_output_image": (["Images","Plot"],),
+                    "diagonal_only": (["False","True"],),},
                 "optional": {
                     "dependencies": ("DEPENDENCIES", ),
                     "X": ("XY", ),
@@ -2366,7 +2485,7 @@ class TSC_XYplot:
     FUNCTION = "XYplot"
     CATEGORY = "Efficiency Nodes/Scripts"
 
-    def XYplot(self, grid_spacing, XY_flip, Y_label_orientation, cache_models, ksampler_output_image, my_unique_id,
+    def XYplot(self, grid_spacing, XY_flip, Y_label_orientation, cache_models, ksampler_output_image, diagonal_only, my_unique_id,
                dependencies=None, X=None, Y=None):
 
         # Unpack X & Y Tuples if connected
@@ -2448,9 +2567,11 @@ class TSC_XYplot:
         # Define Ksampler output image behavior
         xyplot_as_output_image = ksampler_output_image == "Plot"
 
+        diag = diagonal_only == "True"
+
         # Pack xyplot tuple into its dictionary item under script
         script = {"xyplot": (X_type, X_value, Y_type, Y_value, grid_spacing, Y_label_orientation, cache_models,
-                        xyplot_as_output_image, my_unique_id, dependencies)}
+                        xyplot_as_output_image, my_unique_id, dependencies, diag)}
 
         return (script,)
 
