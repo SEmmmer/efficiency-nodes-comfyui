@@ -858,6 +858,9 @@ class TSC_KSampler:
             else:
                 raise ValueError(f"Unexpected xyplot tuple length: {len(xy)}")
 
+            # Force Images mode even for old workflows that may still carry "Plot".
+            xyplot_as_output_image = False
+
             if isinstance(save_compressed_plot_image, str):
                 save_compressed_plot_image = save_compressed_plot_image == "True"
 
@@ -2548,7 +2551,6 @@ class TSC_XYplot:
                     "XY_flip": (["False","True"],),
                     "Y_label_orientation": (["Horizontal", "Vertical"],),
                     "cache_models": (["True", "False"],),
-                    "ksampler_output_image": (["Images","Plot"],),
                     "diagonal_only": (["False","True"],),
                     "save_compressed_plot_image": (["False","True"],),
                     "plot_image_prefix": ("STRING", {"default": "xyplot", "multiline": False}),
@@ -2566,7 +2568,7 @@ class TSC_XYplot:
     FUNCTION = "XYplot"
     CATEGORY = "Efficiency Nodes/Scripts"
 
-    def XYplot(self, grid_spacing, XY_flip, Y_label_orientation, cache_models, ksampler_output_image, diagonal_only,
+    def XYplot(self, grid_spacing, XY_flip, Y_label_orientation, cache_models, diagonal_only,
                save_compressed_plot_image, plot_image_prefix, compressed_plot_image_prefix, compressed_plot_image_scale, my_unique_id,
                dependencies=None, X=None, Y=None):
 
@@ -2646,8 +2648,8 @@ class TSC_XYplot:
             X_type, Y_type = Y_type, X_type
             X_value, Y_value = Y_value, X_value
             
-        # Define Ksampler output image behavior
-        xyplot_as_output_image = ksampler_output_image == "Plot"
+        # Always use Images mode; plot and compressed plot are saved in addition to image output.
+        xyplot_as_output_image = False
 
         diag = diagonal_only == "True"
         save_compressed = save_compressed_plot_image == "True"
