@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 import ast
+import io
 from pathlib import Path
 from importlib import import_module
 import os
@@ -17,6 +18,7 @@ import copy
 import subprocess
 import json
 import psutil
+import folder_paths
 
 from comfy_extras.nodes_align_your_steps import AlignYourStepsScheduler
 from comfy_extras.nodes_gits import GITSScheduler
@@ -65,6 +67,33 @@ REFINER_CFG_OFFSET = 0 #Refiner CFG Offset
 # Monkey patch schedulers
 SCHEDULER_NAMES = samplers.SCHEDULER_NAMES + ["AYS SD1", "AYS SDXL", "AYS SVD", "GITS"]
 SCHEDULERS = samplers.KSampler.SCHEDULERS + ["AYS SD1", "AYS SDXL", "AYS SVD", "GITS"]
+
+def _encode_png_bytes(image):
+    buf = io.BytesIO()
+    image.save(buf, format="PNG", optimize=True, compress_level=9)
+    return buf.getvalue()
+
+def _prepare_compressed_plot_image(plot_pil, scale_percent):
+    try:
+        scale_percent = int(scale_percent)
+    except Exception:
+        raise ValueError("compressed_plot_image_scale must be an integer in [1, 100].")
+
+    if scale_percent < 1 or scale_percent > 100:
+        raise ValueError("compressed_plot_image_scale must be in [1, 100].")
+
+    source = plot_pil.convert("RGBA") if plot_pil.mode not in ("RGB", "RGBA") else plot_pil.copy()
+
+    if scale_percent == 100:
+        image = source
+    else:
+        ratio = scale_percent / 100.0
+        new_w = max(1, int(round(source.width * ratio)))
+        new_h = max(1, int(round(source.height * ratio)))
+        image = source.resize((new_w, new_h), resample=Image.LANCZOS)
+
+    encoded_size = len(_encode_png_bytes(image))
+    return pil2tensor(image), encoded_size, scale_percent
 
 ########################################################################################################################
 # Common function for encoding prompts
@@ -802,16 +831,46 @@ class TSC_KSampler:
 
             # Unpack script Tuple (X_type, X_value, Y_type, Y_value, grid_spacing, Y_label_orientation, dependencies)
             xy = script["xyplot"]
-            # 兼容旧 tuple（10项）与新 tuple（11项，末尾带 diag_only）
+            # tuple compatibility:
+            # 10: legacy
+            # 11: legacy + diag_only
+            # 15: + save_compressed_plot_image, plot_image_prefix,
+            #     compressed_plot_image_prefix, compressed_plot_image_scale
             if len(xy) == 10:
                 X_type, X_value, Y_type, Y_value, grid_spacing, Y_label_orientation, cache_models, xyplot_as_output_image, \
                     xyplot_id, dependencies = xy
                 diag_only = False
+                save_compressed_plot_image = False
+                plot_image_prefix = "xyplot"
+                compressed_plot_image_prefix = "xyplot_compressed"
+                compressed_plot_image_scale = 100
             elif len(xy) == 11:
                 X_type, X_value, Y_type, Y_value, grid_spacing, Y_label_orientation, cache_models, xyplot_as_output_image, \
                     xyplot_id, dependencies, diag_only = xy
+                save_compressed_plot_image = False
+                plot_image_prefix = "xyplot"
+                compressed_plot_image_prefix = "xyplot_compressed"
+                compressed_plot_image_scale = 100
+            elif len(xy) == 15:
+                X_type, X_value, Y_type, Y_value, grid_spacing, Y_label_orientation, cache_models, xyplot_as_output_image, \
+                    xyplot_id, dependencies, diag_only, save_compressed_plot_image, plot_image_prefix, \
+                    compressed_plot_image_prefix, compressed_plot_image_scale = xy
             else:
                 raise ValueError(f"Unexpected xyplot tuple length: {len(xy)}")
+
+            if isinstance(save_compressed_plot_image, str):
+                save_compressed_plot_image = save_compressed_plot_image == "True"
+
+            if not isinstance(plot_image_prefix, str):
+                plot_image_prefix = str(plot_image_prefix)
+            if not isinstance(compressed_plot_image_prefix, str):
+                compressed_plot_image_prefix = str(compressed_plot_image_prefix)
+            try:
+                compressed_plot_image_scale = int(compressed_plot_image_scale)
+            except Exception:
+                compressed_plot_image_scale = 100
+            if compressed_plot_image_scale < 1 or compressed_plot_image_scale > 100:
+                raise ValueError("compressed_plot_image_scale must be in [1, 100].")
 
 
             #_______________________________________________________________________________________________________
@@ -1534,9 +1593,10 @@ class TSC_KSampler:
                 X_value = _strip_sr_none_first(X_type, X_value)
                 Y_value = _strip_sr_none_first(Y_type, Y_value)
 
-                # 严格绑定（你也可以改成 min 截断）
                 if X_type != "Nothing" and Y_type != "Nothing" and len(X_value) != len(Y_value):
-                    raise ValueError(f"Diagonal XY requires len(X)==len(Y). X={len(X_value)} Y={len(Y_value)}")
+                    raise ValueError(
+                        f"diag_only=True requires x==y (len(X)==len(Y)). X={len(X_value)} Y={len(Y_value)}"
+                    )
 
             # Clone original model parameters
             def clone_or_none(*originals):
@@ -1593,21 +1653,16 @@ class TSC_KSampler:
                                        refiner_positive, refiner_negative, latent_image, denoise, vae, vae_decode, sampler_type, xy_capsule=xy_capsule)
 
                 elif X_type != "Nothing" and Y_type != "Nothing":
-                    for Y_index, Y in enumerate(Y_value):
+                    if diag_only:
+                        y_iterable = [(X_index, Y_value[X_index])]
+                    else:
+                        y_iterable = enumerate(Y_value)
 
-                        # diag_only: 只在对角线(X_index==Y_index)跑采样，其余格子塞占位，保证拼图不崩
+                    for Y_index, Y in y_iterable:
                         if diag_only and (X_index != Y_index):
-                            w = empty_latent_width if empty_latent_width else 512
-                            h = empty_latent_height if empty_latent_height else 512
-                            ph_pil = Image.new("RGB", (w, h), (255, 255, 255))
-                            image_pil_list.append(ph_pil)
-                            image_tensor_list.append(pil2tensor(ph_pil))
-                            # latent 占位：按 latent_image 的 key 做 zeros_like，保证后面 torch.cat 不炸
-                            if isinstance(latent_image, dict):
-                                latent_list.append({k: torch.zeros_like(v) for k, v in latent_image.items()})
-                            else:
-                                latent_list.append(latent_image)
-                            continue
+                            raise ValueError(
+                                f"diag_only=True requires x==y coordinates, got x={X_index}, y={Y_index}."
+                            )
 
 
                         if Y_type == "XY_Capsule" or X_type == "XY_Capsule":
@@ -1650,8 +1705,9 @@ class TSC_KSampler:
                                            return_with_leftover_noise, cfg, sampler_name, scheduler[0],
                                            positive, negative, refiner_positive, refiner_negative, latent_image,
                                            denoise, vae, vae_decode, sampler_type, xy_capsule=xy_capsule)
-                        diag_image_tensor_list.append(image_tensor_list[-1])
-                        diag_latent_entries.append(latent_list[-1])
+                        if diag_only:
+                            diag_image_tensor_list.append(image_tensor_list[-1])
+                            diag_latent_entries.append(latent_list[-1])
 
             # Clean up cache
             if cache_models == "False":
@@ -2051,26 +2107,26 @@ class TSC_KSampler:
             num_cols = max(len(X_value) if X_value is not None else 0, 1)
 
             # ----------------------------------------------------------------------
-            # ✅ diag_only：强制把拼图变成 1×N（只显示 LoRA），不再当成网格，也不需要 Y 轴
+            # diag_only: collapse to 1xN and hide Y-axis labels.
             if diag_only:
                 print("DIAG COLLAPSE ACTIVE", len(diag_image_tensor_list))
                 if len(diag_image_tensor_list) == 0:
                     raise ValueError("diag_only: diag_image_tensor_list is empty")
 
-                # 用对角线真实采样结果替换掉网格列表
+                # Replace the full grid list with diagonal samples only.
                 image_tensor_list = diag_image_tensor_list[:]
-                latent_list = diag_latent_entries[:]  # 后面 cat 只 cat 这 N 份
+                latent_list = diag_latent_entries[:]  # Keep only diagonal latent entries.
                 image_pil_list = [tensor2pil(t) for t in image_tensor_list]
 
                 num_rows = 1
                 num_cols = len(image_pil_list)
 
-                # 禁用 Y 轴（不留左边距，不画标签）
+                # Disable Y-axis spacing/labels in diagonal-only mode.
                 Y_type = "Nothing"
                 Y_label = []
-                Y_value = [""]  # 让 print_plot_variables 不再显示 8×9
+                Y_value = [""]  # Keep print summary aligned with the collapsed view.
 
-                # ⚠️ 关键：diag_only 时不要再跑 rearrange_list_*，否则又回到网格语义
+                # Do not run rearrange_list_* in diag_only mode.
             else:
                 # Flip X & Y results back if flipped earlier
                 if flip_xy == True:
@@ -2086,24 +2142,24 @@ class TSC_KSampler:
             # ----------------------------------------------------------------------
 
             # -----------------------------------------------------------------------------------
-            # diag_only 总图模式：只输出 1 行 N 列（只显示 LoRA），完全禁用 Y 轴（提示词那维不显示）
+            # diag_only plot mode: force a 1xN strip from diagonal samples.
             if diag_only and xyplot_as_output_image:
                 if len(diag_image_tensor_list) == 0:
                     raise ValueError("diag_only+Plot: diag_image_tensor_list is empty (no diagonal samples collected).")
 
-                # 1) 只用对角线真实采样结果（别用带 placeholder 的网格列表）
-                image_tensor_list = diag_image_tensor_list[:]  # 用于后面取 i_height/i_width 等
-                latent_list = diag_latent_entries[:]  # 用于后面 cat 合并
-                image_pil_list = [tensor2pil(t) for t in image_tensor_list]  # 用于拼图 paste
+                # 1) Use true diagonal samples only (no placeholders).
+                image_tensor_list = diag_image_tensor_list[:]  # Used for size extraction later.
+                latent_list = diag_latent_entries[:]  # Used for latent concatenation later.
+                image_pil_list = [tensor2pil(t) for t in image_tensor_list]  # Used for plot paste.
 
-                # 2) 强制 1 行 N 列
+                # 2) Force one row and N columns.
                 num_rows = 1
                 num_cols = len(image_pil_list)
 
-                # 3) 彻底禁用 Y 轴（不画、不留边距、不访问 Y_label）
+                # 3) Fully disable Y-axis drawing/margins.
                 Y_type = "Nothing"
                 Y_label = []
-                Y_value = [""]  # 可选：让打印/信息更一致（不再显示 8x9）
+                Y_value = [""]  # Keep output summary consistent with 1xN.
             # -----------------------------------------------------------------------------------
 
             # Extract final image dimensions
@@ -2268,9 +2324,9 @@ class TSC_KSampler:
 
             xy_plot_image = pil2tensor(background)
 
-        # --- 缩放 plot 到 75%（用于预览 + 自动保存）---
+        # Create a smaller preview image for UI rendering only.
+        plot_pil = tensor2pil(xy_plot_image)
         try:
-            plot_pil = tensor2pil(xy_plot_image)  # tensor2pil 通常会取 batch 的第一张
             w, h = plot_pil.size
             nw = max(1, int(w * 0.5))
             nh = max(1, int(h * 0.5))
@@ -2280,25 +2336,46 @@ class TSC_KSampler:
             print(f"{warning('XY Plot Warning:')} plot resize failed, using original plot. err={e}")
             xy_plot_image_small = xy_plot_image
 
-        # 预览显示缩小版（避免预览区太大、也少点开销）
         preview_images = PreviewImage().save_images(xy_plot_image_small)["ui"]["images"]
 
-        # 如果当前输出模式是 Images（不是 Plot），就把缩小后的 plot 额外保存到 output 目录
-        # 这样你不用右键保存预览图了
-        if xyplot_as_output_image == False:
+        # Save full-size plot image with user-provided prefix.
+        if xyplot_as_output_image == False and plot_image_prefix.strip() != "":
             try:
-                # filename_prefix 你可以随便改，比如 "xyplot_75"
-                SaveImage().save_images(xy_plot_image_small, filename_prefix="单次")
+                SaveImage().save_images(xy_plot_image, filename_prefix=plot_image_prefix)
             except Exception as e:
-                print(f"{warning('XY Plot Warning:')} auto-save plot failed. err={e}")
+                print(f"{warning('XY Plot Warning:')} save plot image failed. err={e}")
+
+        # Optionally save a compressed plot image using a fixed scale percent.
+        if xyplot_as_output_image == False and save_compressed_plot_image:
+            if compressed_plot_image_prefix.strip() == "":
+                print(f"{warning('XY Plot Warning:')} compressed plot prefix is empty; skip compressed save.")
+            else:
+                try:
+                    compressed_plot_tensor, saved_bytes, used_scale = _prepare_compressed_plot_image(
+                        plot_pil,
+                        compressed_plot_image_scale,
+                    )
+                    save_info = SaveImage().save_images(compressed_plot_tensor, filename_prefix=compressed_plot_image_prefix)
+                    saved_file = None
+                    if isinstance(save_info, dict):
+                        images_meta = save_info.get("ui", {}).get("images", [])
+                        if len(images_meta) > 0 and isinstance(images_meta[0], dict):
+                            saved_file = images_meta[0].get("filename", None)
+                    saved_mb = round(saved_bytes / (1024 * 1024), 4)
+                    if saved_file is not None:
+                        print(f"{info('XY Plot Info:')} Compressed plot saved -> {saved_file} ({saved_mb} MB, scale={used_scale}%)")
+                    else:
+                        print(f"{info('XY Plot Info:')} Compressed plot saved ({saved_mb} MB, scale={used_scale}%)")
+                except Exception as e:
+                    print(f"{warning('XY Plot Warning:')} save compressed plot failed. err={e}")
 
         # Generate output_images
         output_images = torch.stack([tensor.squeeze() for tensor in image_tensor_list])
 
-        # diag_only + Images：输出只给对角线那 N 张（绑定后的 lora/prompt 对）
+        # diag_only + Images: return only the diagonal N samples.
         if diag_only and (xyplot_as_output_image == False):
             output_images = torch.stack([t.squeeze() for t in diag_image_tensor_list])
-            # latent 也同步改成对角线
+            # Keep latent output synchronized to diagonal-only images.
             if len(diag_latent_entries) > 0:
                 keys = diag_latent_entries[0].keys()
                 latent_list = {k: torch.cat([d[k] for d in diag_latent_entries], dim=0) for k in keys}
@@ -2472,7 +2549,11 @@ class TSC_XYplot:
                     "Y_label_orientation": (["Horizontal", "Vertical"],),
                     "cache_models": (["True", "False"],),
                     "ksampler_output_image": (["Images","Plot"],),
-                    "diagonal_only": (["False","True"],),},
+                    "diagonal_only": (["False","True"],),
+                    "save_compressed_plot_image": (["False","True"],),
+                    "plot_image_prefix": ("STRING", {"default": "xyplot", "multiline": False}),
+                    "compressed_plot_image_prefix": ("STRING", {"default": "xyplot_compressed", "multiline": False}),
+                    "compressed_plot_image_scale": ("INT", {"default": 100, "min": 1, "max": 100, "step": 1}),},
                 "optional": {
                     "dependencies": ("DEPENDENCIES", ),
                     "X": ("XY", ),
@@ -2485,7 +2566,8 @@ class TSC_XYplot:
     FUNCTION = "XYplot"
     CATEGORY = "Efficiency Nodes/Scripts"
 
-    def XYplot(self, grid_spacing, XY_flip, Y_label_orientation, cache_models, ksampler_output_image, diagonal_only, my_unique_id,
+    def XYplot(self, grid_spacing, XY_flip, Y_label_orientation, cache_models, ksampler_output_image, diagonal_only,
+               save_compressed_plot_image, plot_image_prefix, compressed_plot_image_prefix, compressed_plot_image_scale, my_unique_id,
                dependencies=None, X=None, Y=None):
 
         # Unpack X & Y Tuples if connected
@@ -2568,10 +2650,12 @@ class TSC_XYplot:
         xyplot_as_output_image = ksampler_output_image == "Plot"
 
         diag = diagonal_only == "True"
+        save_compressed = save_compressed_plot_image == "True"
 
         # Pack xyplot tuple into its dictionary item under script
         script = {"xyplot": (X_type, X_value, Y_type, Y_value, grid_spacing, Y_label_orientation, cache_models,
-                        xyplot_as_output_image, my_unique_id, dependencies, diag)}
+                        xyplot_as_output_image, my_unique_id, dependencies, diag, save_compressed,
+                        plot_image_prefix, compressed_plot_image_prefix, compressed_plot_image_scale)}
 
         return (script,)
 
